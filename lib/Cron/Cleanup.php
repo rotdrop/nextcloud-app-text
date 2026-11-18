@@ -16,6 +16,7 @@ use OCP\AppFramework\Utility\ITimeFactory;
 use OCP\BackgroundJob\TimedJob;
 use OCP\Files\ISetupManager;
 use OCP\Files\NotPermittedException;
+use OCP\Files\StorageNotAvailableException;
 use Psr\Log\LoggerInterface;
 
 class Cleanup extends TimedJob {
@@ -44,6 +45,9 @@ class Cleanup extends TimedJob {
 			$this->setupManager->tearDown();
 			try {
 				$this->attachmentService->cleanupAttachments($document->getContextId());
+			} catch (StorageNotAvailableException $e) {
+				$this->logger->debug('Deferring attachment cleanup for file ' . $document->getContextId() . ': storage is unavailable', ['exception' => $e]);
+				continue;
 			} catch (NotPermittedException $e) {
 				// Retrying will not help until the document is saved again, so mark it as cleaned up anyway
 				$this->logger->warning('Could not clean up attachments of file ' . $document->getContextId() . ', deleting is not permitted', ['exception' => $e]);
