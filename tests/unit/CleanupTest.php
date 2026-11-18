@@ -21,6 +21,7 @@ use OCP\Files\IRootFolder;
 use OCP\Files\ISetupManager;
 use OCP\Files\Node;
 use OCP\Files\NotPermittedException;
+use OCP\Files\StorageNotAvailableException;
 use OCP\FilesMetadata\IFilesMetadataManager;
 use OCP\IPreview;
 use OCP\ISession;
@@ -31,6 +32,8 @@ use Psr\Log\LoggerInterface;
 class CleanupTest extends \PHPUnit\Framework\TestCase {
 	private Cleanup $cleanup;
 	private Document $document;
+	/** @var Document[] */
+	private array $documents;
 	private DocumentService $documentService;
 	private AttachmentService $attachmentService;
 	private SessionService $sessionService;
@@ -46,6 +49,7 @@ class CleanupTest extends \PHPUnit\Framework\TestCase {
 			'context_id' => 123,
 			'last_saved_version_time' => 1000,
 		]);
+		$this->documents = [$this->document];
 		$this->documentService = $this->createMock(DocumentService::class);
 		$this->rootFolder = $this->createMock(IRootFolder::class);
 		$this->attachmentService = new AttachmentService(
@@ -67,7 +71,7 @@ class CleanupTest extends \PHPUnit\Framework\TestCase {
 		$this->documentService->expects(self::once())
 			->method('getAllPendingAttachmentCleanup')
 			->willReturn((function (): \Generator {
-				yield $this->document;
+				yield from $this->documents;
 			})());
 		$this->cleanup = new class($this->createMock(ITimeFactory::class), $this->sessionService, $this->documentService, $this->attachmentService, $this->logger, $this->setupManager, $this->lockCleanupService) extends Cleanup {
 			public function run($argument): void {
@@ -168,5 +172,47 @@ class CleanupTest extends \PHPUnit\Framework\TestCase {
 		$this->lockCleanupService->expects(self::never())->method('release');
 
 		$this->cleanup->run([]);
+	}
+
+	public function testUnavailableStorageRemainsPendingAndJobContinues(): void {
+		$nextDocument = Document::fromRow([
+			'id' => '123456789012345679',
+			'context_type' => 'file',
+			'context_id' => 456,
+			'last_saved_version_time' => 1000,
+		]);
+		$this->documents[] = $nextDocument;
+		$exception = $this->createMock(StorageNotAvailableException::class);
+		$this->documentService->expects(self::exactly(2))
+			->method('hasUnsavedChanges')->willReturn(false);
+		$this->setupManager->expects(self::exactly(2))->method('tearDown');
+		$this->rootFolder->expects(self::exactly(2))
+			->method('getFirstNodeById')
+			->willReturnCallback(function (int $fileId) use ($exception): ?Node {
+				if ($fileId === 123) {
+					throw $exception;
+				}
+				self::assertSame(456, $fileId);
+				return null;
+			});
+		$this->logger->expects(self::never())->method('warning');
+		$logged = false;
+		$this->logger->expects(self::atLeastOnce())->method('debug')
+			->willReturnCallback(function (string $message, array $context = []) use ($exception, &$logged): void {
+				if (isset($context['exception'])) {
+					self::assertSame('Deferring attachment cleanup for file 123: storage is unavailable', $message);
+					self::assertSame($exception, $context['exception']);
+					$logged = true;
+				}
+			});
+		$this->documentService->expects(self::once())
+			->method('markAttachmentCleanup')->with($nextDocument);
+		$this->sessionService->expects(self::once())->method('removeInactiveSessionsWithoutSteps');
+		$this->sessionService->expects(self::once())->method('removeOldSessions');
+		$this->sessionService->expects(self::once())->method('removeOrphanedSteps');
+		$this->documentService->expects(self::once())->method('cleanupOldDocumentsFolders');
+
+		$this->cleanup->run([]);
+		self::assertTrue($logged);
 	}
 }
